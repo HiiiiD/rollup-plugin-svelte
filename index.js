@@ -2,6 +2,7 @@ const path = require('path');
 const relative = require('require-relative');
 const { createFilter } = require('@rollup/pluginutils');
 const { compile, preprocess } = require('svelte/compiler');
+const fs = require('fs');
 
 const PREFIX = '[rollup-plugin-svelte]';
 const pkg_export_errors = new Set();
@@ -42,6 +43,8 @@ module.exports = function (options = {}) {
 		compilerOptions.css = false;
 	}
 
+	let allSubComponents = [];
+
 	return {
 		name: 'svelte',
 
@@ -59,7 +62,6 @@ module.exports = function (options = {}) {
 			if (name && name[0] === '@') {
 				name += `/${parts.shift()}`;
 			}
-
 			try {
 				const file = `${name}/package.json`;
 				const resolved = relative.resolve(file, path.dirname(importer));
@@ -108,6 +110,43 @@ module.exports = function (options = {}) {
 				code = processed.code;
 			}
 
+			// compile subcomponents
+			const subComponentNames = new Set();
+			const subComponentShortNames = new Set();
+			code = code.replace(/{#component(.*?)}(.*?){\/component}/sg, (fullMatch, attributes, subComponentCode, ...restArgs) => {
+				const subName = attributes.trim();
+				if (subName.match(/[A-Z]\w*/) == null) {
+					throw new Error(`Invalid subcomponent name: ${subName}`); // TODO is this raised? use this.warn()
+				}
+				const subComponentFileName = filename.replace(/(\.svelte)$/, '__' + subName + '$1');
+
+				const subComponent = {
+					code: subComponentCode,
+					filename: subComponentFileName
+				};
+				
+
+				allSubComponents.push(subComponent);
+				fs.writeFileSync(subComponentFileName, subComponentCode, { encoding: 'utf-8' });
+				const splittedName = subComponentFileName.split('\\');
+				subComponentNames.add(subComponentFileName);
+				subComponentShortNames.add(`${splittedName[splittedName.length - 1]}`);
+				return '';
+			});
+
+			if (subComponentNames.size > 0) {
+				const subComponentsJoined = [...subComponentShortNames].map(subComp => {
+					const subComponentName = subComp.replace('.svelte', '').split('__')[1];
+					return `import ${subComponentName} from './${subComp}'`;
+				}).join(';');
+				code = code.replace('\r\n', '\n');
+				const scriptIdx = code.indexOf('<script');
+				const slicedCode = code.slice(scriptIdx);
+				const newLineIdx = slicedCode.indexOf('\n');
+				const importIdx = scriptIdx + newLineIdx;
+				code = `${code.slice(0, importIdx)}${subComponentsJoined}\n${code.slice(importIdx + 1)}`;
+			}
+
 			const compiled = compile(code, svelte_options);
 
 			(compiled.warnings || []).forEach(warning => {
@@ -127,7 +166,7 @@ module.exports = function (options = {}) {
 			} else {
 				compiled.js.dependencies = dependencies;
 			}
-
+			compiled.js.dependencies = dependencies;
 			return compiled.js;
 		},
 
@@ -138,6 +177,18 @@ module.exports = function (options = {}) {
 			if (pkg_export_errors.size > 0) {
 				console.warn(`\n${PREFIX} The following packages did not export their \`package.json\` file so we could not check the "svelte" field. If you had difficulties importing svelte components from a package, then please contact the author and ask them to export the package.json file.\n`);
 				console.warn(Array.from(pkg_export_errors, s => `- ${s}`).join('\n') + '\n');
+			}
+		},
+
+		buildStart() {
+			for (const comp of allSubComponents) {
+				fs.writeFileSync(comp.filename, comp.code, { encoding: 'utf-8' });
+			}
+		},
+		moduleParsed({ id }) {
+			//If a module is a subcomponent, then delete it
+			if (/\w*__\w*.svelte/.test(id)) {
+				fs.unlinkSync(path.relative(process.cwd(), id));
 			}
 		}
 	};
